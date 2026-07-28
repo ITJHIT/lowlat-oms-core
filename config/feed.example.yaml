@@ -1,0 +1,7 @@
+# Example operational config for the Linux feed handler.
+# Flat key: value only (see include/lloms/config.hpp).
+port: 9001
+max_order_qty: 1000
+max_position: 5000
+reference_price: 1000
+price_band: 50

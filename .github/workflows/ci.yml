@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+      - name: build
+        run: cmake --build build --config Release -j
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+      - name: smoke-bench
+        run: |
+          ./build/bench_ring_buffer 500000
+          ./build/bench_matching 500000
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: cmake -B build
+      - name: build
+        run: cmake --build build --config Release -j
+      - name: test
+        run: ctest --test-dir build -C Release --output-on-failure
