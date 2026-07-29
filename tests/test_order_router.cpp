@@ -32,22 +32,22 @@ RouteRequest req(Symbol sym, Qty qty = 10, bool liquidating = false) {
 
 TEST_CASE("a venue is unusable until it logs on") {
     OrderRouter r(1);
-    const VenueId krx = r.add_venue("KRX");
-    REQUIRE(krx != kNoVenue);
-    CHECK(r.venue_state(krx) == VenueState::Down);  // not Up by default
-    CHECK(r.map_symbol(5, krx));
+    const VenueId primary = r.add_venue("PRIMARY");
+    REQUIRE(primary != kNoVenue);
+    CHECK(r.venue_state(primary) == VenueState::Down);  // not Up by default
+    CHECK(r.map_symbol(5, primary));
 
     // Down: nothing goes out, however well-formed the order is.
     RouteResult first = r.route(req(5));
     CHECK(first.decision == RouteDecision::RejectVenueDown);
-    CHECK_EQ(first.venue, krx);  // the reject still says which session
+    CHECK_EQ(first.venue, primary);  // the reject still says which session
     CHECK_EQ(first.client_order_id, 0u);
 
-    r.on_logon(krx);
-    CHECK(r.venue_state(krx) == VenueState::Up);
+    r.on_logon(primary);
+    CHECK(r.venue_state(primary) == VenueState::Up);
     RouteResult second = r.route(req(5));
     CHECK(second.decision == RouteDecision::Routed);
-    CHECK_EQ(second.venue, krx);
+    CHECK_EQ(second.venue, primary);
     CHECK(second.client_order_id != 0u);
     CHECK_EQ(second.venue_seq, 1u);
 
@@ -261,14 +261,16 @@ TEST_CASE("venue lookups on unknown ids answer safely instead of reading out of 
 // ---------------------------------------------------------------------------
 
 TEST_CASE("venues and routes come up from a config file") {
+    // Venue names are opaque labels to the router; these are role-shaped
+    // placeholders, and the spacing is ragged on purpose to exercise trimming.
     const Config cfg = Config::from_string(
         "# venue topology\n"
-        "venues: KRX, NASDAQ , ARCA\n"
-        "venue_state.KRX: up\n"
-        "venue_state.NASDAQ: drain\n"
-        "route.5: KRX\n"
-        "route.42: NASDAQ\n"
-        "route.7: ARCA\n");
+        "venues: PRIMARY, ATS , DARK\n"
+        "venue_state.PRIMARY: up\n"
+        "venue_state.ATS: drain\n"
+        "route.5: PRIMARY\n"
+        "route.42: ATS\n"
+        "route.7: DARK\n");
 
     OrderRouter r(20260729);
     std::string err;
@@ -276,18 +278,18 @@ TEST_CASE("venues and routes come up from a config file") {
     CHECK(err.empty());
 
     CHECK_EQ(r.venue_count(), 3u);
-    const VenueId krx = r.find_venue("KRX");
-    const VenueId nasdaq = r.find_venue("NASDAQ");
-    const VenueId arca = r.find_venue("ARCA");
-    REQUIRE(krx != kNoVenue);
+    const VenueId primary = r.find_venue("PRIMARY");
+    const VenueId ats = r.find_venue("ATS");
+    const VenueId dark = r.find_venue("DARK");
+    REQUIRE(primary != kNoVenue);
 
-    CHECK(r.venue_state(krx) == VenueState::Up);
-    CHECK(r.venue_state(nasdaq) == VenueState::DrainOnly);
-    CHECK(r.venue_state(arca) == VenueState::Down);  // unstated means down
+    CHECK(r.venue_state(primary) == VenueState::Up);
+    CHECK(r.venue_state(ats) == VenueState::DrainOnly);
+    CHECK(r.venue_state(dark) == VenueState::Down);  // unstated means down
 
-    CHECK_EQ(r.venue_for(5), krx);
-    CHECK_EQ(r.venue_for(42), nasdaq);
-    CHECK_EQ(r.venue_for(7), arca);
+    CHECK_EQ(r.venue_for(5), primary);
+    CHECK_EQ(r.venue_for(42), ats);
+    CHECK_EQ(r.venue_for(7), dark);
     CHECK_EQ(r.venue_for(999), kNoVenue);
 
     CHECK(r.route(req(5)).decision == RouteDecision::Routed);
@@ -299,28 +301,28 @@ TEST_CASE("a config typo fails the start instead of silently dropping a route") 
     OrderRouter a(1);
     std::string err;
     CHECK(!configure_router(
-        Config::from_string("venues: KRX\nroute.5: NYSE\n"), a, err));
+        Config::from_string("venues: PRIMARY\nroute.5: UNDECLARED\n"), a, err));
     CHECK(!err.empty());
 
     OrderRouter b(1);
     CHECK(!configure_router(
-        Config::from_string("venues: KRX\nroute.abc: KRX\n"), b, err));
+        Config::from_string("venues: PRIMARY\nroute.abc: PRIMARY\n"), b, err));
 
     OrderRouter c(1);
     CHECK(!configure_router(
-        Config::from_string("venues: KRX\nvenue_state.KRX: maybe\n"), c, err));
+        Config::from_string("venues: PRIMARY\nvenue_state.PRIMARY: maybe\n"), c, err));
 
     OrderRouter d(1);
     CHECK(!configure_router(
-        Config::from_string("venues: KRX\nvenue_state.NYSE: up\n"), d, err));
+        Config::from_string("venues: PRIMARY\nvenue_state.UNDECLARED: up\n"), d, err));
 
     OrderRouter e(1);
-    CHECK(!configure_router(Config::from_string("venues: KRX,KRX\n"), e, err));
+    CHECK(!configure_router(Config::from_string("venues: PRIMARY,PRIMARY\n"), e, err));
 
     // A symbol past 32 bits is a typo, not a symbol.
     OrderRouter f(1);
     CHECK(!configure_router(
-        Config::from_string("venues: KRX\nroute.99999999999: KRX\n"), f, err));
+        Config::from_string("venues: PRIMARY\nroute.99999999999: PRIMARY\n"), f, err));
 }
 
 TEST_CASE("an empty config yields a router that rejects everything, not one that guesses") {

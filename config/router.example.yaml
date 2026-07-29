@@ -7,18 +7,23 @@
 session_epoch: 20260729
 
 # Venue IDs are assigned in the order listed here (1, 2, 3 ...).
-venues: KRX, NASDAQ, ARCA
+#
+# The names are opaque labels: the router compares them and nothing else, so
+# they carry no semantics into the code. These are placeholders named after the
+# role a destination plays -- a primary exchange, an alternative trading system,
+# a dark pool -- because a deployment names its own sessions here.
+venues: PRIMARY, ATS, DARK
 
 # Optional. Anything unstated stays down until the session logs on -- orders are
 # rejected until then, which is the safe default for a process that just booted.
 #   up     normal operation
 #   drain  winding down: liquidating orders only, no new risk
 #   down   no session
-venue_state.KRX: up
-venue_state.NASDAQ: up
-venue_state.ARCA: drain
+venue_state.PRIMARY: up
+venue_state.ATS: up
+venue_state.DARK: drain
 
 # symbol -> venue. A symbol with no entry is rejected, never guessed.
-route.5: KRX
-route.42: NASDAQ
-route.7: ARCA
+route.5: PRIMARY
+route.42: ATS
+route.7: DARK

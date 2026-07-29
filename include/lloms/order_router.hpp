@@ -156,10 +156,10 @@ class OrderRouter {
 // re-point a symbol without a rebuild:
 //
 //   session_epoch: 20260729     # read by the caller when constructing the router
-//   venues: KRX,NASDAQ          # ids assigned in listed order
-//   venue_state.KRX: up         # optional; default is down until logon
-//   route.5: KRX                # symbol 5 -> KRX
-//   route.42: NASDAQ
+//   venues: PRIMARY,ATS         # ids assigned in listed order; names are opaque
+//   venue_state.PRIMARY: up     # optional; default is down until logon
+//   route.5: PRIMARY            # symbol 5 -> PRIMARY
+//   route.42: ATS
 //
 // Returns false and fills `error` on the first problem rather than starting
 // half-configured -- a router missing one route silently rejects that symbol's
