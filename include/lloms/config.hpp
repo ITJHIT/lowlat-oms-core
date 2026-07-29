@@ -6,12 +6,14 @@
 // YAML implementation.
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace lloms {
 
@@ -54,6 +56,19 @@ class Config {
     }
 
     std::size_t size() const { return kv_.size(); }
+
+    // Every key present, sorted. Needed by callers whose config is open-ended --
+    // `route.<symbol>: <venue>` entries, for instance, cannot be fetched by name
+    // because the names are not known until the file is read.
+    std::vector<std::string> keys() const {
+        std::vector<std::string> out;
+        out.reserve(kv_.size());
+        for (const auto& kv : kv_) {
+            out.push_back(kv.first);
+        }
+        std::sort(out.begin(), out.end());  // hash order is not reproducible
+        return out;
+    }
 
   private:
     void parse_line(std::string line) {

@@ -1,0 +1,19 @@
+# Example config for the two-process shared-memory demo (apps/shm_ipc_posix.cpp).
+# Flat key: value only (see include/lloms/config.hpp).
+
+# POSIX shared-memory object name; must start with '/'.
+shm_name: /lloms_ipc_demo
+
+# Slots per ring, power of two. Two rings are created (writer->reader and back).
+capacity: 4096
+
+# Phase 1: one-way flood, measures cross-process throughput.
+stream_count: 2000000
+
+# Phase 2: depth-1 round trips, measures the IPC hand-off itself.
+rtt_iters: 200000
+
+# Give each process its own core. Latency tails on an unpinned run measure the
+# scheduler, not the queue -- the demo prints whether pinning actually took.
+writer_core: 0
+reader_core: 1

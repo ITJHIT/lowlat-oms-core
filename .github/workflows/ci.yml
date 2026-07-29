@@ -22,6 +22,27 @@ jobs:
         run: |
           ./build/bench_ring_buffer 500000
           ./build/bench_matching 500000
+          ./build/bench_pingpong 50000
+      # The two-process shared-memory path cannot be exercised by unit tests --
+      # it needs a real fork and a real mmap'd segment. Small counts keep it
+      # fast; a non-zero exit means the processes lost or corrupted a message.
+      - name: smoke-shm-ipc
+        run: |
+          cat > /tmp/ci_shm.yaml <<'EOF'
+          shm_name: /lloms_ci_demo
+          capacity: 1024
+          stream_count: 200000
+          rtt_iters: 20000
+          writer_core: 0
+          reader_core: 1
+          EOF
+          ./build/shm_ipc /tmp/ci_shm.yaml
+      - name: shared-memory segment was cleaned up
+        run: |
+          if ls /dev/shm/lloms_* 2>/dev/null; then
+            echo "leaked shared-memory segment"; exit 1
+          fi
+          echo "no leftover segments"
 
   windows:
     runs-on: windows-latest
@@ -33,3 +54,7 @@ jobs:
         run: cmake --build build --config Release -j
       - name: test
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: smoke-bench
+        run: |
+          ./build/Release/bench_ring_buffer.exe 500000
+          ./build/Release/bench_pingpong.exe 50000

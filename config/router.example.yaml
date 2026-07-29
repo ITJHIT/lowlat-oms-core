@@ -1,0 +1,24 @@
+# Example venue topology for the order router.
+# Flat key: value only (see include/lloms/config.hpp).
+
+# Must change every run. A boot counter or the date both work; it becomes the
+# high 32 bits of every client order ID so a restart cannot re-issue an ID that
+# is still live at a venue.
+session_epoch: 20260729
+
+# Venue IDs are assigned in the order listed here (1, 2, 3 ...).
+venues: KRX, NASDAQ, ARCA
+
+# Optional. Anything unstated stays down until the session logs on -- orders are
+# rejected until then, which is the safe default for a process that just booted.
+#   up     normal operation
+#   drain  winding down: liquidating orders only, no new risk
+#   down   no session
+venue_state.KRX: up
+venue_state.NASDAQ: up
+venue_state.ARCA: drain
+
+# symbol -> venue. A symbol with no entry is rejected, never guessed.
+route.5: KRX
+route.42: NASDAQ
+route.7: ARCA

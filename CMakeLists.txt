@@ -10,7 +10,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+    # C4324 fires on every alignas(64) member: "structure was padded due to
+    # alignment specifier". That padding is the entire point here -- it is what
+    # keeps a producer index and a consumer index off the same cache line -- so
+    # the warning reports the design working, not a defect.
+    add_compile_options(/W4 /permissive- /wd4324)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -22,9 +26,22 @@ add_library(lloms
     src/order_book.cpp
     src/matching_engine.cpp
     src/risk_gate.cpp
-    src/latency_histogram.cpp)
+    src/latency_histogram.cpp
+    src/wire.cpp
+    src/order_router.cpp
+    src/cpu.cpp
+    src/posix_shm.cpp)
 target_include_directories(lloms PUBLIC include)
 target_compile_features(lloms PUBLIC cxx_std_17)
+# Thread affinity needs pthread; shared memory needs librt on older glibc
+# (shm_open moved into libc in glibc 2.34, so treat rt as optional).
+target_link_libraries(lloms PUBLIC Threads::Threads)
+if(UNIX AND NOT APPLE)
+    find_library(LLOMS_RT_LIB rt)
+    if(LLOMS_RT_LIB)
+        target_link_libraries(lloms PUBLIC ${LLOMS_RT_LIB})
+    endif()
+endif()
 
 # ---- tests ----------------------------------------------------------------
 enable_testing()
@@ -35,7 +52,10 @@ add_executable(unit_tests
     tests/test_matching_engine.cpp
     tests/test_risk_gate.cpp
     tests/test_latency_histogram.cpp
-    tests/test_config.cpp)
+    tests/test_config.cpp
+    tests/test_wire.cpp
+    tests/test_shm_ring.cpp
+    tests/test_order_router.cpp)
 target_include_directories(unit_tests PRIVATE tests)
 target_link_libraries(unit_tests PRIVATE lloms Threads::Threads)
 add_test(NAME unit_tests COMMAND unit_tests)
@@ -44,11 +64,21 @@ add_test(NAME unit_tests COMMAND unit_tests)
 add_executable(bench_ring_buffer bench/bench_ring_buffer.cpp)
 target_link_libraries(bench_ring_buffer PRIVATE lloms Threads::Threads)
 
+add_executable(bench_pingpong bench/bench_pingpong.cpp)
+target_link_libraries(bench_pingpong PRIVATE lloms Threads::Threads)
+
 add_executable(bench_matching bench/bench_matching.cpp)
 target_link_libraries(bench_matching PRIVATE lloms Threads::Threads)
 
-# ---- Linux-only feed handler (epoll) --------------------------------------
+# ---- POSIX-only apps ------------------------------------------------------
 if(UNIX AND NOT APPLE)
+    # epoll feed handler: network thread -> ring buffer -> risk + matching
     add_executable(feed_handler apps/feed_handler_linux.cpp)
     target_link_libraries(feed_handler PRIVATE lloms Threads::Threads)
+endif()
+
+if(UNIX)
+    # two processes, one shared-memory segment, two lock-free rings
+    add_executable(shm_ipc apps/shm_ipc_posix.cpp)
+    target_link_libraries(shm_ipc PRIVATE lloms Threads::Threads)
 endif()
