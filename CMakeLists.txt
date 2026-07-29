@@ -28,6 +28,7 @@ add_library(lloms
     src/risk_gate.cpp
     src/latency_histogram.cpp
     src/wire.cpp
+    src/session.cpp
     src/order_router.cpp
     src/cpu.cpp
     src/posix_shm.cpp)
@@ -54,6 +55,7 @@ add_executable(unit_tests
     tests/test_latency_histogram.cpp
     tests/test_config.cpp
     tests/test_wire.cpp
+    tests/test_session.cpp
     tests/test_shm_ring.cpp
     tests/test_order_router.cpp)
 target_include_directories(unit_tests PRIVATE tests)

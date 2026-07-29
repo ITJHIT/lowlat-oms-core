@@ -22,6 +22,7 @@ part that generalizes across firms.
 | **Shared-memory ring** | `shm_ring.hpp` | The same queue across a **process boundary**: lock-free-atomic enforcement, fixed-width indices, a validated on-segment header, and range-checked reads because a peer process's indices are untrusted input. |
 | **POSIX shared memory** | `posix_shm.hpp` | RAII over `shm_open`/`ftruncate`/`mmap`: move-only, unlink-on-destroy by the creator only, every failure path cleaning up the name it created. |
 | **Wire protocol** | `wire.hpp` | Exchange-style binary framing: big-endian codec, incremental decode across arbitrary TCP splits, resync on corruption, forward-compatible unknown-type skipping, sequence-gap detection. |
+| **Session layer** | `session.hpp` | The layer above framing: logon sequence agreement, gap recovery that *pauses delivery* rather than acting out of order, GapFill vs Reset semantics, duplicate suppression, and two-step liveness. A pure state machine — no socket, no clock, no thread — so the hard cases are testable. |
 | **Order book** | `order_book.hpp` | Price-time priority limit book. Bids best-first, asks best-first, FIFO within a level, O(log) cancel via an id→location index. |
 | **Matching engine** | `matching_engine.hpp` | Continuous matching: sweeps levels while the taker crosses, fills at the maker price, rests the limit remainder, markets never rest. |
 | **Risk gate** | `risk_gate.hpp` | Pre-trade checks: max order size, net-position limit, price collar, sanity. The generic form of a live kill-switch — strategy-agnostic. |
