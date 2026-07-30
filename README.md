@@ -192,6 +192,17 @@ in the unit test — all tested:
 
 ## epoll vs. io_uring
 
+> **Status: resolved.** Building both handlers side by side and holding them to
+> the same benchmark surfaced five real bugs in the io_uring handler — all five
+> are root-caused, fixed, and re-verified below. The one thing that's *not*
+> resolved, and is called out explicitly near the end of this section rather
+> than glossed over, is narrower than that: this specific CI benchmark's
+> pass/fail tolerance isn't tight enough to reliably catch a *subtle*
+> regression on GitHub's shared runners (it does reliably catch a gross one —
+> a hang, crash, or near-total loss, which is what all five original bugs
+> were). That is a statement about this one tolerance value on this one CI
+> environment, not about the handler's correctness.
+
 Both feed handlers run the identical pipeline — accept, decode a 24-byte frame,
 push to the SPSC ring, risk-check, match — over the identical wire format.
 The only thing that differs between `feed_handler_linux.cpp` and
