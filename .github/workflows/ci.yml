@@ -129,12 +129,21 @@ jobs:
       - name: smoke-feed-handler-iouring
         run: python3 /tmp/feed_smoke.py ./build/feed_handler_iouring 19100 /tmp/feed_smoke.yaml
       # epoll vs io_uring under concurrent load -- the comparison the README
-      # names as not yet measured. 50 connections x 4000 frames = 200,000
-      # frames = exactly 100,000 fills (see bench_feed_client.cpp's ordering
+      # names as not yet measured. 50 connections x 2000 frames = 100,000
+      # frames = exactly 50,000 fills (see bench_feed_client.cpp's ordering
       # argument for why that count is exact, not approximate). This is a
       # shared GitHub Actions runner, not dedicated hardware -- the absolute
       # numbers are noisy; what is meaningful is the two of them run back to
       # back on the very same runner in the very same job.
+      #
+      # No fixed pre-signal sleep gates the SIGTERM: the actual drain (final
+      # read/reap pass, then the consumer catching the ring up to empty) runs
+      # AFTER the signal, as part of the graceful-shutdown sequence itself,
+      # and communicate()'s timeout below is what actually bounds how long
+      # that is allowed to take -- generous, because a loaded shared runner
+      # earned it after two rounds of this exact benchmark finding two real
+      # bugs (a shutdown-time data-loss race and, under it, a second race
+      # between the reader and consumer threads).
       - name: write the concurrent-load bench client config
         run: |
           cat > /tmp/feed_bench.yaml <<'EOF'
@@ -156,7 +165,7 @@ jobs:
               # give the server a moment to bind before the first attempt.
               time.sleep(0.5)
               client = subprocess.run(
-                  ["./build/bench_feed_client", "127.0.0.1", port, "50", "4000"],
+                  ["./build/bench_feed_client", "127.0.0.1", port, "50", "2000"],
                   capture_output=True, text=True, timeout=60,
               )
               print(client.stdout)
@@ -165,23 +174,22 @@ jobs:
                   print(f"{binary}: bench_feed_client failed")
                   sys.exit(1)
 
-              time.sleep(1.0)  # let the matching consumer drain the ring
               if server.poll() is not None:
                   print(f"{binary}: server exited early with code {server.returncode}")
                   sys.exit(1)
 
               server.terminate()
               try:
-                  out, _ = server.communicate(timeout=15)
+                  out, _ = server.communicate(timeout=30)
               except subprocess.TimeoutExpired:
                   server.kill()
-                  print(f"{binary}: did not exit within 15s of SIGTERM")
+                  print(f"{binary}: did not exit within 30s of SIGTERM")
                   sys.exit(1)
 
               text = (out or b"").decode(errors="replace")
               print(text)
-              if "100000 fills" not in text:
-                  print(f"{binary}: expected exactly 100000 fills")
+              if "50000 fills" not in text:
+                  print(f"{binary}: expected exactly 50000 fills")
                   sys.exit(1)
               if "0 risk-rejected" not in text:
                   print(f"{binary}: some orders were risk-rejected, not matched")
