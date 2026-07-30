@@ -283,10 +283,24 @@ int main(int argc, char** argv) {
                     }
                 }
                 submit_recv(&uring, c);
+            } else if (res == -EAGAIN || res == -EINTR) {
+                // Transient, not a dead connection: io_uring's recv fast path
+                // can surface EAGAIN instead of internally arming a poll and
+                // waiting -- documented io_uring behavior under socket-buffer
+                // or io-wq scheduling pressure, which a busy shared CI runner
+                // reproduces far more often than a quiet box. Found by this
+                // being the one case still treated as "peer went away" even
+                // after the accept-backlog drain fix, and a benchmark that
+                // kept losing hundreds of frames from what should have been
+                // healthy connections -- discarding the connection here would
+                // throw away every frame it had left to send, not just the
+                // one recv that happened to come back EAGAIN. Resubmit and
+                // keep going, exactly like a real error is NOT handled.
+                submit_recv(&uring, c);
             } else {
-                // res == 0: peer closed. res < 0: -errno; treat identically --
-                // there is nothing this feed handler can do with a dead
-                // connection except stop tracking it.
+                // res == 0: peer closed. res < 0 other than the transient
+                // cases above: a real error. Nothing this feed handler can do
+                // with a dead connection except stop tracking it.
                 ::close(c->fd);
                 conns.erase(c->fd);
             }
