@@ -200,14 +200,28 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Final drain, found the hard way (a 200k-frame concurrent-load benchmark
-    // came up short by a few dozen fills in CI). g_running flipping false only
-    // guarantees the epoll_wait call ALREADY IN PROGRESS finishes; it says
-    // nothing about whether every byte a connection's kernel receive buffer
-    // was already holding got read before the outer loop stopped asking. One
-    // more non-blocking pass over every still-open connection, unconditional
-    // on g_running, closes that race instead of leaving already-arrived data
-    // silently unread.
+    // Catch any connections still sitting in the accept backlog. A connection
+    // whose TCP handshake completed but which this process had not yet called
+    // accept() for does not exist in `partial` yet -- no drain pass below,
+    // however thorough, could ever see data on a fd that was never opened.
+    // listen_fd is already non-blocking (set at creation), so this drains the
+    // backlog rather than blocking on it.
+    {
+        int conn;
+        while ((conn = ::accept(listen_fd, nullptr, nullptr)) >= 0) {
+            set_nonblocking(conn);
+            partial[conn];
+        }
+    }
+
+    // Final drain, found the hard way (a concurrent-load benchmark came up
+    // short in CI, twice, for two different reasons). g_running flipping
+    // false only guarantees the epoll_wait call ALREADY IN PROGRESS finishes;
+    // it says nothing about whether every byte a connection's kernel receive
+    // buffer was already holding got read before the outer loop stopped
+    // asking. One more non-blocking pass over every now-known connection,
+    // unconditional on g_running, closes that race instead of leaving
+    // already-arrived data silently unread.
     for (auto& [fd, buf] : partial) {
         unsigned char tmp[4096];
         ssize_t r;

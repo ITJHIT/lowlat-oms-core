@@ -333,6 +333,29 @@ int main(int argc, char** argv) {
                 while (!ring.push(o)) {
                 }
             }
+        } else if (op->kind == OpKind::Accept && cqe->res >= 0) {
+            // A connection whose accept only completed during this drain
+            // phase has no outstanding recv SQE and nothing here will submit
+            // one (shutdown is underway) -- so it gets one inline synchronous
+            // drain instead, rather than being silently discarded along with
+            // every frame it was ever going to send. This is exactly the
+            // fallback the header comment above says to avoid for a
+            // connection with a recv SQE genuinely racing the kernel; there
+            // is no such race here, since this connection never had one.
+            const int conn_fd = cqe->res;
+            std::vector<unsigned char> late;
+            unsigned char tmp[kRecvBufSize];
+            ssize_t r;
+            while ((r = ::recv(conn_fd, tmp, sizeof(tmp), MSG_DONTWAIT)) > 0) {
+                late.insert(late.end(), tmp, tmp + r);
+                while (late.size() >= kFrameSize) {
+                    Order o = decode(late.data());
+                    late.erase(late.begin(), late.begin() + kFrameSize);
+                    while (!ring.push(o)) {
+                    }
+                }
+            }
+            ::close(conn_fd);
         }
         delete op;
         io_uring_cqe_seen(&uring, cqe);

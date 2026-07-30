@@ -136,14 +136,18 @@ jobs:
       # numbers are noisy; what is meaningful is the two of them run back to
       # back on the very same runner in the very same job.
       #
-      # No fixed pre-signal sleep gates the SIGTERM: the actual drain (final
-      # read/reap pass, then the consumer catching the ring up to empty) runs
-      # AFTER the signal, as part of the graceful-shutdown sequence itself,
-      # and communicate()'s timeout below is what actually bounds how long
-      # that is allowed to take -- generous, because a loaded shared runner
-      # earned it after two rounds of this exact benchmark finding two real
-      # bugs (a shutdown-time data-loss race and, under it, a second race
-      # between the reader and consumer threads).
+      # A pre-signal sleep turned out to matter for a reason unrelated to
+      # draining the ring: the final drain pass only visits fds already in
+      # its connection map, which only happens once accept() has actually
+      # been called for that connection. Removing the sleep (on the theory
+      # that only post-signal draining mattered) made a HALVED load fail by
+      # a LARGER margin -- the signature of the server not having gotten
+      # around to accept()ing every connection yet, under a contended
+      # runner, before being asked to shut down. A still-outstanding accept
+      # means the fd does not exist in the server's own bookkeeping yet, so
+      # no drain pass at any point after that can possibly see it. Restored,
+      # generously, alongside the already-generous post-signal
+      # communicate() timeout that bounds the actual ring drain.
       - name: write the concurrent-load bench client config
         run: |
           cat > /tmp/feed_bench.yaml <<'EOF'
@@ -174,6 +178,7 @@ jobs:
                   print(f"{binary}: bench_feed_client failed")
                   sys.exit(1)
 
+              time.sleep(3.0)
               if server.poll() is not None:
                   print(f"{binary}: server exited early with code {server.returncode}")
                   sys.exit(1)
