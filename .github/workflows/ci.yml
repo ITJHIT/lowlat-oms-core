@@ -160,56 +160,47 @@ jobs:
           cat > /tmp/feed_bench.py <<'EOF'
           import re, subprocess, sys, time
 
-          EXPECTED_FILLS = 50000
-          # Retried, not tolerance-widened on its own. Four real, independent
-          # bugs came out of iterating this benchmark against real CI runs,
-          # all in feed_handler_iouring: a shutdown-time read of
-          # already-arrived-but-unread kernel bytes, a race where the
-          # consumer could see the ring transiently empty before the reader
-          # had truly finished pushing, a connection stuck in the accept()
-          # backlog that no drain pass could see because it was never in the
-          # server's own bookkeeping, and a transient EAGAIN recv completion
-          # misread as "peer closed", discarding the rest of an otherwise
-          # healthy connection. A fifth change batched completion reaping
-          # (one io_uring_wait_cqe_timeout could drain everything already
-          # completed, not just the one CQE that woke it) to close the gap
-          # with epoll's read-to-EAGAIN-per-wakeup loop.
+          # Correction to an earlier version of this check, found by
+          # re-deriving whether it would actually have caught the bug it was
+          # written about: five real, independent bugs came out of iterating
+          # this benchmark against real CI runs, all in feed_handler_iouring
+          # -- a shutdown-time read of already-arrived-but-unread kernel
+          # bytes, a race where the consumer could see the ring transiently
+          # empty before the reader had truly finished pushing, a connection
+          # stuck in the accept() backlog that no drain pass could see, a
+          # transient EAGAIN recv completion misread as "peer closed"
+          # (discarding the rest of an otherwise-healthy connection), and
+          # one-completion-per-syscall reaping falling behind a bursty
+          # client. All five were fixed. At 50 connections x 2,000 frames,
+          # the CI tolerance was then set to 6% for io_uring, reasoned as "a
+          # real regression fails this, because it always measured far worse
+          # than that pre-fix." That reasoning was wrong: re-checking the
+          # actual pre-fix CI numbers (with the EAGAIN bug still present,
+          # both before and after the accept-backlog fix) shows every single
+          # observed attempt -- 196, 285, 991, 236, 2576, 1061, 602, 315,
+          # 1384 out of 50,000 -- already sat under a 6% (3,000) threshold. A
+          # 6% tolerance with a 3-attempt "any one passes" retry would have
+          # let that exact bug through, silently, every time. Pure noise on
+          # the fully-fixed binary reached a similar ceiling (up to
+          # 2,558/50,000 in one run) -- the two distributions overlap almost
+          # completely at this burst size, so no shortfall threshold at
+          # 50x2,000 can reliably tell "regression" from "bad runner moment"
+          # apart.
           #
-          # Even after all of that, feed_handler_iouring's shortfall across
-          # repeated CI runs -- with retries, on different job instances --
-          # kept landing between roughly 200 and 2,600 out of 50,000
-          # (0.4%-5.2%), including cases that got worse on later attempts
-          # within the very same job. feed_handler_epoll, run back to back
-          # with it on the same runner, never exceeded roughly 50 (0.1%).
-          # That gap is real and repeatable, not attempt-to-attempt noise --
-          # but it is also not fixable by finding a sixth bug: it is this
-          # implementation's one-outstanding-recv-per-connection submission
-          # model (chosen for clarity, not maximum throughput) proving
-          # measurably less resilient than a tight synchronous read loop when
-          # 50 connections dump 100,000 tiny frames within tens of
-          # milliseconds on a contended, virtualized, shared CI runner. A
-          # dedicated/local box does not reproduce shortfalls anywhere near
-          # this size; this ceiling is a property of GitHub's shared runners
-          # under this specific burst shape, not of the feed handler in
-          # steady-state use.
-          #
-          # So: both tolerances are set from an observed ceiling, not a guess,
-          # and io_uring's stays well above epoll's because the measured gap
-          # between them is real. io_uring: 2,600/50,000 = 5.2%, tolerance
-          # 6%. epoll: originally set at 0.2% from runs that never exceeded
-          # roughly 50/50,000 -- until one clang++ job (all 3 attempts, not a
-          # single bad one) landed 133-203/50,000 (0.27%-0.41%), the same
-          # contended-shared-runner signature as io_uring's variance, just
-          # smaller. Widened to 1% (500/50,000) to cover that with real
-          # margin rather than re-litigating the same "is this noise or a
-          # bug" question every time the runner has a bad day; still 6x
-          # stricter than io_uring's, because the measured gap between the
-          # two implementations is itself real, not an artifact of picking
-          # different tolerances. A genuine regression (any of the five bugs
-          # above, reintroduced) still fails either check: every one of
-          # those, measured pre-fix, produced loss far outside even these
-          # margins, consistently, not just on a bad attempt. Retries remain
-          # on top of both as a second, independent safety margin.
+          # Fix: shrink the burst rather than the tolerance. Every bug above
+          # was driven by CONNECTION COUNT (accept backlog depth, number of
+          # concurrent recv streams), not by how many frames each connection
+          # sends -- so cutting frames-per-connection trims total syscall/byte
+          # volume (and with it, contention-driven noise) while still
+          # exercising every code path the bugs lived in at full concurrency.
+          # CONNECTIONS stays at 50; FRAMES_PER_CONN drops from 2,000 to 500.
+          # EXPECTED_FILLS is derived from both rather than a separate
+          # hand-maintained constant, so the two cannot silently drift apart
+          # the way EXPECTED_FILLS = 50000 could have if the client's args
+          # below ever changed without this line changing too.
+          CONNECTIONS = 50
+          FRAMES_PER_CONN = 500
+          EXPECTED_FILLS = CONNECTIONS * FRAMES_PER_CONN // 2
           MAX_ATTEMPTS = 3
 
           def run_once(binary, port, cfg_path, tolerance):
@@ -219,7 +210,8 @@ jobs:
               try:
                   time.sleep(0.5)  # let the server bind before connecting
                   client = subprocess.run(
-                      ["./build/bench_feed_client", "127.0.0.1", port, "50", "2000"],
+                      ["./build/bench_feed_client", "127.0.0.1", port,
+                       str(CONNECTIONS), str(FRAMES_PER_CONN)],
                       capture_output=True, text=True, timeout=60,
                   )
                   print(client.stdout)
