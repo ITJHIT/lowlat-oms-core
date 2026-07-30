@@ -44,6 +44,7 @@
 #if defined(LLOMS_HAVE_LIBURING)
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <liburing.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -89,6 +90,11 @@ std::atomic<bool> g_running{true};
 // drain pushes something after the ring last looked empty to the consumer.
 std::atomic<bool> g_reader_done{false};
 
+bool set_nonblocking(int fd) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    return flags != -1 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
+}
+
 int make_listen_socket(std::uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -103,7 +109,10 @@ int make_listen_socket(std::uint16_t port) {
         ::close(fd);
         return -1;
     }
-    if (::listen(fd, SOMAXCONN) < 0) {
+    // Non-blocking so the shutdown-time backlog drain below (a plain ::accept
+    // loop) can never block waiting for a connection that is never coming --
+    // io_uring's own async accept does not care about this flag either way.
+    if (::listen(fd, SOMAXCONN) < 0 || !set_nonblocking(fd)) {
         ::close(fd);
         return -1;
     }
@@ -359,6 +368,36 @@ int main(int argc, char** argv) {
         }
         delete op;
         io_uring_cqe_seen(&uring, cqe);
+    }
+
+    // Accept-backlog drain, mirroring feed_handler_linux.cpp's identical fix
+    // (found the same way: a concurrent-load benchmark coming up short, worse
+    // the more connections piled up). Exactly one accept SQE is ever
+    // outstanding at a time in the main loop above -- each Accept completion
+    // re-arms only the next single one -- and nothing re-arms it anymore once
+    // shutdown begins. So the CQE-reap loop just above can catch at most ONE
+    // more connection from the kernel's accept backlog; every other
+    // connection still sitting there is invisible to it, because a
+    // connection this process has not called accept() on yet has no fd, no
+    // Conn, and no outstanding SQE for any drain pass to find. listen_fd is
+    // non-blocking, so this drains the backlog rather than blocking on it.
+    {
+        int conn_fd;
+        while ((conn_fd = ::accept(listen_fd, nullptr, nullptr)) >= 0) {
+            std::vector<unsigned char> late;
+            unsigned char tmp[kRecvBufSize];
+            ssize_t r;
+            while ((r = ::recv(conn_fd, tmp, sizeof(tmp), MSG_DONTWAIT)) > 0) {
+                late.insert(late.end(), tmp, tmp + r);
+                while (late.size() >= kFrameSize) {
+                    Order o = decode(late.data());
+                    late.erase(late.begin(), late.begin() + kFrameSize);
+                    while (!ring.push(o)) {
+                    }
+                }
+            }
+            ::close(conn_fd);
+        }
     }
 
     // Outstanding SQEs (the last accept, and one recv per still-open
