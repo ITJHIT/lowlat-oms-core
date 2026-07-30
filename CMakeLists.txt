@@ -77,6 +77,22 @@ if(UNIX AND NOT APPLE)
     # epoll feed handler: network thread -> ring buffer -> risk + matching
     add_executable(feed_handler apps/feed_handler_linux.cpp)
     target_link_libraries(feed_handler PRIVATE lloms Threads::Threads)
+
+    # io_uring feed handler: same pipeline, io_uring instead of epoll on the
+    # network thread. Built only when liburing is actually present -- the
+    # source file itself degrades to a stub without it (see the file header),
+    # so this find is an optimization (skip a doomed compile) rather than a
+    # correctness requirement.
+    find_path(LLOMS_URING_INCLUDE_DIR liburing.h)
+    find_library(LLOMS_URING_LIB uring)
+    if(LLOMS_URING_INCLUDE_DIR AND LLOMS_URING_LIB)
+        add_executable(feed_handler_iouring apps/feed_handler_iouring_linux.cpp)
+        target_include_directories(feed_handler_iouring PRIVATE ${LLOMS_URING_INCLUDE_DIR})
+        target_link_libraries(feed_handler_iouring PRIVATE lloms Threads::Threads ${LLOMS_URING_LIB})
+    else()
+        message(STATUS "liburing not found -- feed_handler_iouring target skipped "
+                        "(install liburing-dev to build it)")
+    endif()
 endif()
 
 if(UNIX)

@@ -12,8 +12,20 @@ jobs:
         compiler: [g++, clang++]
     steps:
       - uses: actions/checkout@v4
+      - name: install liburing
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev
       - name: configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+      - name: confirm the io_uring target was actually configured
+        # If liburing were silently not found, CMakeLists.txt skips the target
+        # entirely (message(STATUS ...), not an error) -- and every step below
+        # would then just quietly never test it, reporting green for a
+        # coverage gap rather than a pass. Asking CMake to build this exact
+        # target by name fails loudly here if it does not exist, instead of
+        # the smoke step three steps down silently having nothing to run.
+        run: cmake --build build --config Release -j --target feed_handler_iouring
       - name: build
         run: cmake --build build --config Release -j
       - name: test
@@ -43,6 +55,79 @@ jobs:
             echo "leaked shared-memory segment"; exit 1
           fi
           echo "no leftover segments"
+      # Neither feed handler was ever driven over a real socket in CI before
+      # this: their pieces (ring buffer, risk gate, matching engine) each have
+      # unit tests, but the accept -> decode -> push pipeline itself did not.
+      # This sends two real TCP frames -- a resting sell, then a crossing buy
+      # -- to each binary and asserts the consumer thread reports the fill,
+      # via a real SIGTERM and a real exit, not a kill -9 that proves nothing.
+      - name: write the socket smoke-test client
+        run: |
+          cat > /tmp/feed_smoke.py <<'EOF'
+          import socket, struct, subprocess, sys, time
+
+          binary, port, cfg_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          proc = subprocess.Popen(
+              [binary, cfg_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+          )
+          try:
+              sock = None
+              for _ in range(50):
+                  try:
+                      sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+                      break
+                  except OSError:
+                      time.sleep(0.2)
+              if sock is None:
+                  print(f"{binary}: could not connect to port {port}")
+                  sys.exit(1)
+
+              def frame(symbol, side, typ, price, qty):
+                  return struct.pack("<IBBHqq", symbol, side, typ, 0, price, qty)
+
+              with sock:
+                  sock.sendall(frame(1, 1, 0, 100, 10))  # resting sell, qty 10 @ 100
+                  sock.sendall(frame(1, 0, 0, 100, 10))  # crossing buy, qty 10 @ 100
+                  time.sleep(0.5)
+
+              # Confirm it is still alive (did not crash processing the frames)
+              # before asking it to shut down.
+              if proc.poll() is not None:
+                  print(f"{binary}: process exited early with code {proc.returncode}")
+                  sys.exit(1)
+
+              proc.terminate()
+              try:
+                  out, _ = proc.communicate(timeout=10)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+                  print(f"{binary}: did not exit within 10s of SIGTERM")
+                  sys.exit(1)
+
+              text = (out or b"").decode(errors="replace")
+              print(text)
+              if "1 fills" not in text:
+                  print(f"{binary}: expected exactly 1 fill, did not see it in output")
+                  sys.exit(1)
+              if "0 risk-rejected" not in text:
+                  print(f"{binary}: the smoke order was risk-rejected, not matched")
+                  sys.exit(1)
+          finally:
+              if proc.poll() is None:
+                  proc.kill()
+                  proc.wait()
+          EOF
+          cat > /tmp/feed_smoke.yaml <<'EOF'
+          port: 19100
+          max_order_qty: 1000
+          max_position: 5000
+          reference_price: 100
+          price_band: 50
+          EOF
+      - name: smoke-feed-handler-epoll
+        run: python3 /tmp/feed_smoke.py ./build/feed_handler 19100 /tmp/feed_smoke.yaml
+      - name: smoke-feed-handler-iouring
+        run: python3 /tmp/feed_smoke.py ./build/feed_handler_iouring 19100 /tmp/feed_smoke.yaml
 
   windows:
     runs-on: windows-latest

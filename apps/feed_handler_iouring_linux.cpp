@@ -1,0 +1,312 @@
+// Linux market-data feed handler: io_uring instead of epoll on the network
+// thread, everything downstream identical to feed_handler_linux.cpp (lock-free
+// SPSC ring hand-off, then a risk+matching consumer thread) -- so the only
+// variable between the two files is the socket I/O model, which is the point.
+//
+// Wire frame (little-endian, 24 bytes, packed) -- identical to
+// feed_handler_linux.cpp, deliberately duplicated (not shared via a header)
+// rather than factored out, so this file's build never depends on that one:
+//   uint32 symbol | uint8 side(0=buy,1=sell) | uint8 type(0=limit,1=market)
+//   uint16 pad    | int64 price | int64 qty
+//
+// What actually changes going from epoll to io_uring, and why it is not just
+// "the same loop with different function names":
+//
+//   epoll tells you a socket is READABLE; you still make a synchronous read()
+//   syscall yourself, into a buffer you own for exactly the duration of that
+//   call. io_uring does the read itself, asynchronously, sometime between
+//   submission and completion -- the buffer you hand it has to stay alive and
+//   unmoved for that entire window, which can span multiple trips around the
+//   event loop. A buffer that lived on the stack of the function that
+//   submitted the request, or inside a std::vector that might reallocate, is a
+//   use-after-free waiting for the kernel to win the race. That is why every
+//   in-flight buffer here lives inside a heap-allocated, pointer-stable Conn
+//   (owned by a std::unique_ptr in a map, never moved, freed only after the
+//   connection has no outstanding request referencing it) rather than a
+//   function-local array.
+//
+//   The other consequence: a completion cannot mean "this fd is ready, go read
+//   it" -- io_uring needs to be told WHICH read (which Conn, which buffer)
+//   completed, since several can be in flight across different connections at
+//   once. Each submitted SQE is tagged with a heap-allocated Op carrying that
+//   context, retrieved from the matching CQE and freed exactly once per
+//   completion.
+//
+// Needs liburing (liburing-dev on Debian/Ubuntu) on a kernel new enough to
+// support it; degrades to a stub message otherwise so the repo is not
+// "io_uring or nothing" on a Linux box that simply lacks the library, the same
+// way the epoll file degrades to a stub off Linux entirely. Verification for
+// this file is CI-only: no Linux toolchain on the machine that wrote it.
+#if defined(__linux__) && __has_include(<liburing.h>)
+#define LLOMS_HAVE_LIBURING 1
+#endif
+
+#if defined(LLOMS_HAVE_LIBURING)
+
+#include <arpa/inet.h>
+#include <liburing.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "lloms/config.hpp"
+#include "lloms/matching_engine.hpp"
+#include "lloms/risk_gate.hpp"
+#include "lloms/spsc_ring_buffer.hpp"
+
+using namespace lloms;
+
+namespace {
+
+constexpr std::size_t kFrameSize = 24;
+// One outstanding accept plus one outstanding recv per live connection, so
+// this comfortably covers ~255 concurrent connections before io_uring_get_sqe
+// could return null from a full submission queue. Demo-scoped: a version meant
+// to run past that would need to flush (io_uring_submit) and retry rather than
+// assume a slot is always available, which the two submit_* helpers below do
+// not do.
+constexpr unsigned kQueueDepth = 256;
+constexpr std::size_t kRecvBufSize = 4096;
+
+std::atomic<bool> g_running{true};
+
+int make_listen_socket(std::uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return -1;
+    }
+    if (::listen(fd, SOMAXCONN) < 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+Order decode(const unsigned char* buf) {
+    Order o{};
+    std::uint32_t symbol;
+    std::uint8_t side, type;
+    std::int64_t price, qty;
+    std::memcpy(&symbol, buf + 0, 4);
+    side = buf[4];
+    type = buf[5];
+    std::memcpy(&price, buf + 8, 8);
+    std::memcpy(&qty, buf + 16, 8);
+    o.symbol = symbol;
+    o.side = side == 0 ? Side::Buy : Side::Sell;
+    o.type = type == 0 ? Type::Limit : Type::Market;
+    o.price = price;
+    o.qty = qty;
+    return o;
+}
+
+// Per-connection state. Allocated once on accept, never moved, freed only
+// after the connection closes and no submitted SQE still points at it --
+// see the file header comment on buffer lifetime.
+struct Conn {
+    int fd = -1;
+    std::vector<unsigned char> partial;         // undecoded bytes carried across reads
+    std::array<unsigned char, kRecvBufSize> buf{};  // the CURRENT in-flight read's target
+};
+
+enum class OpKind : std::uint8_t { Accept, Recv };
+
+// Tag attached to one submitted SQE, retrieved from its CQE on completion.
+// Heap-allocated per submission and freed exactly once, by whichever code path
+// handles that completion -- there is exactly one CQE per SQE, so this cannot
+// double-free or leak in the steady state (see the shutdown note below for the
+// one place it deliberately does not bother).
+struct Op {
+    OpKind kind;
+    Conn* conn;  // null for Accept
+};
+
+void submit_accept(io_uring* ring, int listen_fd) {
+    io_uring_sqe* sqe = io_uring_get_sqe(ring);
+    io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
+    io_uring_sqe_set_data(sqe, new Op{OpKind::Accept, nullptr});
+}
+
+void submit_recv(io_uring* ring, Conn* c) {
+    io_uring_sqe* sqe = io_uring_get_sqe(ring);
+    io_uring_prep_recv(sqe, c->fd, c->buf.data(), c->buf.size(), 0);
+    io_uring_sqe_set_data(sqe, new Op{OpKind::Recv, c});
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    // Graceful shutdown, matching feed_handler_linux.cpp exactly: flip the
+    // flag, let the wait-with-timeout loop below notice it on its own.
+    std::signal(SIGINT, [](int) { g_running.store(false); });
+    std::signal(SIGTERM, [](int) { g_running.store(false); });
+
+    Config cfg = argc > 1 ? Config::from_file(argv[1]) : Config{};
+    const auto port = static_cast<std::uint16_t>(cfg.get_int("port", 9001));
+
+    static SpscRingBuffer<Order, 1u << 16> ring;
+    RiskGate gate(RiskLimits{cfg.get_int("max_order_qty", 1000),
+                             cfg.get_int("max_position", 0),
+                             cfg.get_int("reference_price", 0),
+                             cfg.get_int("price_band", 0)});
+
+    std::thread consumer([&] {
+        MatchingEngine eng(1);
+        std::vector<Fill> fills;
+        std::uint64_t matched = 0, rejected = 0;
+        Order o;
+        while (g_running.load(std::memory_order_relaxed) || !ring.empty()) {
+            if (!ring.pop(o)) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (gate.check(o, 0) != RiskDecision::Accept) {
+                ++rejected;
+                continue;
+            }
+            fills.clear();
+            eng.submit(o, fills);
+            matched += fills.size();
+        }
+        std::printf("consumer stopped: %llu fills, %llu risk-rejected\n",
+                    (unsigned long long)matched, (unsigned long long)rejected);
+    });
+
+    const int listen_fd = make_listen_socket(port);
+    if (listen_fd < 0) {
+        std::perror("listen");
+        g_running.store(false);
+        consumer.join();
+        return 1;
+    }
+
+    io_uring uring;
+    if (io_uring_queue_init(kQueueDepth, &uring, 0) < 0) {
+        std::perror("io_uring_queue_init");
+        ::close(listen_fd);
+        g_running.store(false);
+        consumer.join();
+        return 1;
+    }
+
+    std::unordered_map<int, std::unique_ptr<Conn>> conns;
+
+    submit_accept(&uring, listen_fd);
+    io_uring_submit(&uring);
+
+    std::printf("io_uring feed handler listening on port %u\n", port);
+
+    while (g_running.load()) {
+        io_uring_cqe* cqe = nullptr;
+        // Timeout, not an unbounded wait, purely so the loop rechecks
+        // g_running periodically -- exactly the role epoll_wait's 1000ms
+        // timeout plays in feed_handler_linux.cpp.
+        __kernel_timespec ts{1, 0};
+        const int rc = io_uring_wait_cqe_timeout(&uring, &cqe, &ts);
+        if (rc == -ETIME || rc == -EINTR) {
+            // -ETIME: nothing completed within the second; go recheck
+            // g_running. -EINTR: a signal (SIGINT/SIGTERM, see above) broke
+            // the wait early -- exactly what should happen, not an error.
+            continue;
+        }
+        if (rc < 0) {
+            break;  // the ring itself is in a bad state; stop rather than spin
+        }
+
+        auto* op = static_cast<Op*>(io_uring_cqe_get_data(cqe));
+        const int res = cqe->res;
+
+        if (op->kind == OpKind::Accept) {
+            if (res >= 0) {
+                const int conn_fd = res;
+                auto c = std::make_unique<Conn>();
+                c->fd = conn_fd;
+                Conn* raw = c.get();
+                conns.emplace(conn_fd, std::move(c));
+                submit_recv(&uring, raw);
+            }
+            // Re-arm regardless: a transient accept error must not stop the
+            // listener from accepting the next connection.
+            submit_accept(&uring, listen_fd);
+        } else {
+            Conn* c = op->conn;
+            if (res > 0) {
+                c->partial.insert(c->partial.end(), c->buf.begin(), c->buf.begin() + res);
+                while (c->partial.size() >= kFrameSize) {
+                    Order o = decode(c->partial.data());
+                    c->partial.erase(c->partial.begin(), c->partial.begin() + kFrameSize);
+                    while (!ring.push(o) && g_running.load()) {
+                    }
+                }
+                submit_recv(&uring, c);
+            } else {
+                // res == 0: peer closed. res < 0: -errno; treat identically --
+                // there is nothing this feed handler can do with a dead
+                // connection except stop tracking it.
+                ::close(c->fd);
+                conns.erase(c->fd);
+            }
+        }
+
+        delete op;
+        io_uring_cqe_seen(&uring, cqe);
+        io_uring_submit(&uring);
+    }
+
+    // Shutdown. Outstanding SQEs (the last accept, and one recv per still-open
+    // connection) are not drained here: their Op allocations leak, once, for a
+    // process that is exiting immediately afterward -- the same category of
+    // non-issue as not calling free() on live heap right before exit(). A
+    // long-running service that starts and stops this loop repeatedly would
+    // need to drain them (io_uring_wait_cqe per outstanding submission) rather
+    // than skip this step; a feed handler process does not.
+    for (auto& [fd, c] : conns) {
+        ::close(fd);
+    }
+    ::close(listen_fd);
+    io_uring_queue_exit(&uring);
+
+    g_running.store(false);
+    consumer.join();
+    return 0;
+}
+
+#else  // not Linux, or liburing unavailable
+
+#include <cstdio>
+int main() {
+#if defined(__linux__)
+    std::printf("feed_handler_iouring needs liburing (liburing-dev) at build "
+                "time. Build on Linux with liburing installed; the portable "
+                "core (ring buffer, order book, matching, risk) runs "
+                "everywhere, and feed_handler_linux (epoll) needs only a "
+                "Linux kernel, no extra library.\n");
+#else
+    std::printf("feed_handler_iouring is Linux-only. The portable core (ring "
+                "buffer, order book, matching, risk) runs everywhere.\n");
+#endif
+    return 0;
+}
+
+#endif

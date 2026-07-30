@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -87,6 +88,13 @@ Order decode(const unsigned char* buf) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Graceful shutdown: a real operator (or a CI smoke test) needs to stop
+    // this process and see the consumer's final tally rather than kill -9 it
+    // and learn nothing. Both signals just flip the flag; the epoll_wait
+    // timeout below (re-checked every loop) is what actually notices it.
+    std::signal(SIGINT, [](int) { g_running.store(false); });
+    std::signal(SIGTERM, [](int) { g_running.store(false); });
+
     Config cfg = argc > 1 ? Config::from_file(argv[1]) : Config{};
     const auto port = static_cast<std::uint16_t>(cfg.get_int("port", 9001));
 

@@ -30,7 +30,8 @@ part that generalizes across firms.
 | **CPU / memory placement** | `cpu.hpp` | Thread pinning and hugepage allocation that report what actually happened instead of silently no-opping. |
 | **Latency histogram** | `latency_histogram.hpp` | HdrHistogram-style bucketing: O(1) record, bounded memory, constant *relative* error, p50/p99/p999 queries. |
 | **Config** | `config.hpp` | Dependency-free flat-YAML-subset loader for config-driven operation. |
-| **Feed handler (Linux)** | `apps/feed_handler_linux.cpp` | `epoll` + non-blocking TCP → ring buffer → risk+matching consumer thread. |
+| **Feed handler, epoll (Linux)** | `apps/feed_handler_linux.cpp` | `epoll` + non-blocking TCP → ring buffer → risk+matching consumer thread. |
+| **Feed handler, io_uring (Linux)** | `apps/feed_handler_iouring_linux.cpp` | The same pipeline, io_uring instead of epoll on the network thread — same wire format, same downstream, so the *only* variable is the socket I/O model. |
 | **Two-process IPC demo** | `apps/shm_ipc_posix.cpp` | `fork` + one shared segment + two lock-free rings: cross-process throughput and round-trip latency, config-driven, both sides pinned. |
 
 ## Build & test
@@ -50,12 +51,19 @@ g++ -std=c++17 -O2 -pthread -Iinclude -Itests \
     tests/*.cpp src/*.cpp -o unit_tests && ./unit_tests
 ```
 
-The Linux-only pieces (`epoll` feed handler, POSIX shared memory) build
+The Linux-only pieces (both feed handlers, POSIX shared memory) build
 automatically where they are supported; on Windows/macOS the portable core,
-tests, and benchmarks still build and run. CI (`.github/workflows/ci.yml`) builds
+tests, and benchmarks still build and run. The io_uring handler additionally
+needs `liburing` (`liburing-dev` on Debian/Ubuntu) at configure time — CMake
+skips just that one target with a `message(STATUS ...)` if it is not found,
+rather than failing the whole build, and CI installs it explicitly so the
+target is never silently skipped there. CI (`.github/workflows/ci.yml`) builds
 and tests on **Linux (g++ and clang++)** and **Windows (MSVC)**, smoke-runs the
-benchmarks, runs the two-process shared-memory demo, and fails the build if that
-demo leaks a shared-memory segment.
+benchmarks, runs the two-process shared-memory demo (failing the build if it
+leaks a shared-memory segment), and drives *both* feed handlers over a real TCP
+socket — a resting order and a crossing one, then a real `SIGTERM` and an
+assertion on the consumer thread's final fill count, not a `kill -9` that would
+prove nothing.
 
 ## Measuring latency honestly
 
@@ -177,6 +185,53 @@ in the unit test — all tested:
    preceded it, including gaps discovered on frames the decoder chose not to
    deliver. A missed sequence number is the cue to request a snapshot rather than
    trade a book you know is wrong.
+
+## epoll vs. io_uring
+
+Both feed handlers run the identical pipeline — accept, decode a 24-byte frame,
+push to the SPSC ring, risk-check, match — over the identical wire format.
+The only thing that differs between `feed_handler_linux.cpp` and
+`feed_handler_iouring_linux.cpp` is how each one talks to the socket, which is
+the actual point of building both rather than just one.
+
+**epoll tells you a socket is readable; you still read it yourself.**
+`epoll_wait` returns, and the handler makes a synchronous `read()` into a
+buffer it owns for exactly the duration of that call — the buffer can live on
+the stack, because by the time control returns from `read()`, the kernel is
+done with it.
+
+**io_uring does the read itself, asynchronously.** A submitted `IORING_OP_RECV`
+completes sometime later, on a trip around the loop that may be several
+iterations away — and the kernel is writing into your buffer for that entire
+window. A buffer that lived on the stack of the function that submitted the
+request is a use-after-free waiting for the kernel to win the race; a
+`std::vector` that might reallocate underneath an in-flight request is the
+same bug with extra steps. That is why every in-flight buffer in the io_uring
+handler lives inside a heap-allocated, pointer-stable `Conn` — owned by a
+`std::unique_ptr` in a map, never moved, freed only once nothing submitted
+still references it — rather than a function-local array. It is also why a
+completion cannot mean "this fd is ready, go read it": io_uring has to be told
+*which* read completed, since several can be in flight across different
+connections at once, so every submitted request is tagged with a
+heap-allocated `Op` carrying that context, retrieved from the matching
+completion and freed exactly once.
+
+Both handlers now support a real graceful shutdown (`SIGINT`/`SIGTERM` flip the
+same atomic flag the accept/wait loop already polls on a timeout) precisely so
+this comparison is something CI can actually drive end-to-end rather than
+merely compile: two real frames over a real socket, a real signal, and an
+assertion on the consumer thread's printed fill count.
+
+**Honestly stated limit of what has been verified.** Every other Linux-only
+piece in this repository (shared memory, thread affinity) has been exercised on
+real Linux CI as part of building it. The io_uring handler was written and
+CI-verified the same way — CI is Linux; this development machine is not — but
+it has not been benchmarked against the epoll handler under real load
+(concurrent connections, sustained throughput, latency percentiles). io_uring's
+usual advantage over epoll is fewer syscalls per message under exactly that
+kind of load, not correctness — both handlers are correctness-equivalent here,
+tested identically — so a throughput/latency comparison is the natural next
+step, not a claim this README makes yet.
 
 ## Order routing
 
