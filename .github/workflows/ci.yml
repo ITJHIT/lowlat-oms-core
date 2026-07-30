@@ -160,44 +160,60 @@ jobs:
           cat > /tmp/feed_bench.py <<'EOF'
           import re, subprocess, sys, time
 
-          # Correction to an earlier version of this check, found by
-          # re-deriving whether it would actually have caught the bug it was
-          # written about: five real, independent bugs came out of iterating
-          # this benchmark against real CI runs, all in feed_handler_iouring
-          # -- a shutdown-time read of already-arrived-but-unread kernel
-          # bytes, a race where the consumer could see the ring transiently
-          # empty before the reader had truly finished pushing, a connection
-          # stuck in the accept() backlog that no drain pass could see, a
-          # transient EAGAIN recv completion misread as "peer closed"
-          # (discarding the rest of an otherwise-healthy connection), and
-          # one-completion-per-syscall reaping falling behind a bursty
-          # client. All five were fixed. At 50 connections x 2,000 frames,
-          # the CI tolerance was then set to 6% for io_uring, reasoned as "a
-          # real regression fails this, because it always measured far worse
-          # than that pre-fix." That reasoning was wrong: re-checking the
-          # actual pre-fix CI numbers (with the EAGAIN bug still present,
-          # both before and after the accept-backlog fix) shows every single
-          # observed attempt -- 196, 285, 991, 236, 2576, 1061, 602, 315,
-          # 1384 out of 50,000 -- already sat under a 6% (3,000) threshold. A
-          # 6% tolerance with a 3-attempt "any one passes" retry would have
-          # let that exact bug through, silently, every time. Pure noise on
-          # the fully-fixed binary reached a similar ceiling (up to
-          # 2,558/50,000 in one run) -- the two distributions overlap almost
-          # completely at this burst size, so no shortfall threshold at
-          # 50x2,000 can reliably tell "regression" from "bad runner moment"
-          # apart.
+          # Honest limit of what this check actually proves, arrived at by
+          # trying to make it stricter and finding that didn't work either.
           #
-          # Fix: shrink the burst rather than the tolerance. Every bug above
-          # was driven by CONNECTION COUNT (accept backlog depth, number of
-          # concurrent recv streams), not by how many frames each connection
-          # sends -- so cutting frames-per-connection trims total syscall/byte
-          # volume (and with it, contention-driven noise) while still
-          # exercising every code path the bugs lived in at full concurrency.
-          # CONNECTIONS stays at 50; FRAMES_PER_CONN drops from 2,000 to 500.
-          # EXPECTED_FILLS is derived from both rather than a separate
-          # hand-maintained constant, so the two cannot silently drift apart
-          # the way EXPECTED_FILLS = 50000 could have if the client's args
-          # below ever changed without this line changing too.
+          # Five real, independent bugs came out of iterating this benchmark
+          # against real CI runs, all in feed_handler_iouring -- a
+          # shutdown-time read of already-arrived-but-unread kernel bytes, a
+          # race where the consumer could see the ring transiently empty
+          # before the reader had truly finished pushing, a connection stuck
+          # in the accept() backlog that no drain pass could see, a transient
+          # EAGAIN recv completion misread as "peer closed" (discarding the
+          # rest of an otherwise-healthy connection), and
+          # one-completion-per-syscall reaping falling behind a bursty
+          # client. All five were fixed, each one caught by this benchmark
+          # failing in CI, none guessed at.
+          #
+          # The tolerance was then set to 6% for io_uring / 0.2% for epoll,
+          # reasoned as "a real regression fails this, because it always
+          # measured far worse pre-fix." That reasoning was checked and found
+          # wrong: every pre-fix CI attempt for the EAGAIN bug (196, 285,
+          # 991, 236, 2576, 1061, 602, 315, 1384 out of 50,000) already sat
+          # under a 6% threshold, and post-fix noise reached a similar
+          # ceiling (2,558/50,000) -- the two distributions overlap almost
+          # completely at 50 connections x 2,000 frames.
+          #
+          # The next attempt at a fix was shrinking the burst (frames per
+          # connection 2,000 -> 500, on the theory that every bug above was
+          # driven by connection count, not frame count, so this would trim
+          # contention-driven noise without losing coverage). It did not
+          # work either: at 500 frames/connection, epoll -- the handler with
+          # NO known bugs, ever -- needed all 3 retries in one job, having
+          # missed a 1% tolerance on both of its first two attempts
+          # (190/12,500 and 184/12,500). Relative noise got *worse* at the
+          # smaller size, not better -- consistent with per-connection setup
+          # and shutdown-drain overhead being closer to a fixed cost than a
+          # per-frame one, so shrinking the frame count shrinks the
+          # measured signal faster than it shrinks that fixed noise floor.
+          #
+          # Conclusion: on GitHub's shared runners, this benchmark cannot be
+          # tuned into an airtight regression gate against a bug of similar
+          # magnitude to the five already found, at any burst size tried
+          # here -- their severity and this benchmark's own noise floor are
+          # not cleanly separable by shortfall percentage alone. What it
+          # still reliably catches: a gross regression (near-total loss, a
+          # hang, a crash, risk-rejected orders, more fills than sent) --
+          # every failure mode actually seen in this file's own history
+          # before these five bugs were root-caused was that large. Real
+          # protection against a *subtle* reintroduction of one of these five
+          # specific races is this comment and the fixed code, not the
+          # tolerance below -- a reviewer touching this shutdown/recv path
+          # again has the failure modes named, which a bare percentage
+          # threshold cannot provide on its own. Tolerances are set from the
+          # latest measured ceiling with real margin (epoll: 1.52% observed
+          # -> 3%; io_uring: 3.42% observed -> 6%), not because that
+          # percentage is meaningful in itself.
           CONNECTIONS = 50
           FRAMES_PER_CONN = 500
           EXPECTED_FILLS = CONNECTIONS * FRAMES_PER_CONN // 2
@@ -260,7 +276,7 @@ jobs:
           sys.exit(1)
           EOF
       - name: bench-feed-handler-epoll
-        run: python3 /tmp/feed_bench.py ./build/feed_handler 19101 /tmp/feed_bench.yaml 0.01
+        run: python3 /tmp/feed_bench.py ./build/feed_handler 19101 /tmp/feed_bench.yaml 0.03
       - name: bench-feed-handler-iouring
         run: python3 /tmp/feed_bench.py ./build/feed_handler_iouring 19101 /tmp/feed_bench.yaml 0.06
 

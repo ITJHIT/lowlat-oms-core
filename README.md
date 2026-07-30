@@ -1,5 +1,9 @@
 # lowlat-oms-core
 
+[![CI](https://github.com/ITJHIT/lowlat-oms-core/actions/workflows/ci.yml/badge.svg)](https://github.com/ITJHIT/lowlat-oms-core/actions/workflows/ci.yml)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](CMakeLists.txt)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 **A low-latency order-matching / OMS core in modern C++17.**
 
 The building blocks a real-time trading/OMS platform is made of, written to be
@@ -226,8 +230,16 @@ assertion on the consumer thread's printed fill count.
 50 connections and sends 2,000 frames each — 100,000 frames, 50,000 of which
 cross (the client's frame pattern alternates a resting sell and a crossing buy
 per price bucket, so the exact expected fill count is provable from TCP's
-per-connection byte-order guarantee alone, not just approximately right). CI
-runs both handlers back to back, on the same job, same runner, same load. A
+per-connection byte-order guarantee alone, not just approximately right).
+Reproduce it yourself — start either handler, then point the client at it:
+
+```bash
+./build/feed_handler config/feed.example.yaml &   # or feed_handler_iouring
+./build/bench_feed_client 127.0.0.1 9001 50 2000
+kill %1
+```
+
+CI runs both handlers back to back, on the same job, same runner, same load. A
 representative pair of runs (g++, GitHub Actions `ubuntu-latest`):
 
 | | send throughput | fills delivered |
@@ -247,28 +259,40 @@ behind a bursty client. All five are fixed; none were guessed at, all were
 root-caused from a failing CI run and re-verified by the same benchmark
 passing.
 
-**What is still honestly true after all five fixes**, and why the CI check for
-the io_uring leg carries a wider tolerance (6% vs. epoll's 1%): under this
-specific burst shape — 50 connections landing 100,000 frames within tens of
-milliseconds — on GitHub's contended, virtualized, shared runners, io_uring's
-one-outstanding-recv-per-connection submission model (chosen here for clarity,
-not maximum throughput) measurably falls further behind than epoll's tight
-read-to-`EAGAIN` loop, and both the shortfall and the send throughput above
-vary noticeably run to run. A dedicated box does not reproduce shortfalls
-anywhere near CI's observed ceiling (up to ~5.2% in the runs used to set that
-tolerance); this is a property of shared-runner scheduling under an extreme
-synthetic burst, not of the feed handler in steady-state use — but reporting
-it as such, rather than smoothing it into a single clean number, is the more
-honest read of what was actually measured. epoll is not immune to the same
-effect, just less exposed to it: one CI run hit 133-203/50,000 (0.27%-0.41%)
-on epoll across all 3 retried attempts, not a single unlucky one, which is
-why its own tolerance sits at 1% rather than the tighter 0.2% this section
-originally shipped with — widened from a second real measurement, not loosened
-to make a red build go away. io_uring's real advantage — fewer syscalls per
-message — is architectural, not yet demonstrated as a throughput *win* against
-epoll at this connection count and message size; a workload that keeps more
-requests genuinely in flight per connection (this handler submits only one
-recv at a time) is the natural next test of that claim, not this one.
+**What is still honestly true after all five fixes**, including one thing that
+turned out to be harder to fix than it first looked: on GitHub's contended,
+virtualized, shared runners, io_uring's one-outstanding-recv-per-connection
+submission model (chosen here for clarity, not maximum throughput) measurably
+falls further behind a bursty client than epoll's tight read-to-`EAGAIN` loop
+— both the shortfall and the send throughput above vary noticeably run to run,
+and a dedicated box does not reproduce shortfalls anywhere near what CI shows.
+That part is a real, repeatable property of this implementation under this
+load, not noise.
+
+What is *not* true, and was claimed here in an earlier version of this
+section: that the CI tolerance is wide enough to absorb that noise while still
+reliably catching a reintroduction of any of the five bugs above. Checked
+against the actual pre-fix CI numbers, it wasn't — every pre-fix attempt for
+the EAGAIN bug landed under the 6% threshold this section originally set, and
+post-fix noise reached a similar ceiling on its own. Shrinking the benchmark's
+burst (2,000 frames/connection down to 500, on the theory that every bug was
+driven by connection count rather than frame count, so this would trim noise
+without losing coverage) didn't fix that either — epoll, which has no known
+bugs at all, needed all 3 of its CI retries at the smaller size, missing a 1%
+tolerance on its first two attempts. Relative noise got worse, not better,
+suggesting per-connection setup/shutdown overhead is closer to a fixed cost
+than a per-frame one. On this infrastructure, at every burst size tried here,
+a subtle regression's severity and this benchmark's own noise floor are not
+cleanly separable by shortfall percentage — this check reliably catches a
+*gross* regression (a hang, a crash, near-total loss), which is the size every
+real failure in this file's history actually was, but a real gate against a
+*subtle* reintroduction of one of these five specific races is this paragraph
+and the fixed code being read by whoever touches this path next, not a
+tolerance value. io_uring's real advantage — fewer syscalls per message — is
+architectural, not yet demonstrated as a throughput *win* against epoll at
+this connection count and message size; a workload that keeps more requests
+genuinely in flight per connection (this handler submits only one recv at a
+time) is the natural next test of that claim, not this one.
 
 ## Order routing
 
