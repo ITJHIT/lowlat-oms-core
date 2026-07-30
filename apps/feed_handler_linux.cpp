@@ -41,6 +41,17 @@ constexpr int kMaxEvents = 64;
 
 std::atomic<bool> g_running{true};
 
+// Set once, by the reader thread, strictly after it has pushed its very last
+// order -- main loop AND the final drain pass both done. Deliberately NOT the
+// same signal as g_running. g_running flips true->false the instant SIGTERM
+// arrives, which is exactly when the reader's final drain is only starting;
+// if the consumer used g_running to decide "nothing more is coming," it could
+// catch the ring transiently empty *between* two of the reader's post-signal
+// pushes and exit right then, silently discarding everything the reader was
+// about to push after that. Found by a concurrent-load benchmark coming up
+// short by a few dozen fills even after the reader-side fix alone.
+std::atomic<bool> g_reader_done{false};
+
 bool set_nonblocking(int fd) {
     const int flags = fcntl(fd, F_GETFL, 0);
     return flags != -1 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
@@ -110,7 +121,7 @@ int main(int argc, char** argv) {
         std::vector<Fill> fills;
         std::uint64_t matched = 0, rejected = 0;
         Order o;
-        while (g_running.load(std::memory_order_relaxed) || !ring.empty()) {
+        while (!g_reader_done.load(std::memory_order_relaxed) || !ring.empty()) {
             if (!ring.pop(o)) {
                 std::this_thread::yield();
                 continue;
@@ -131,6 +142,7 @@ int main(int argc, char** argv) {
     if (listen_fd < 0) {
         std::perror("listen");
         g_running.store(false);
+        g_reader_done.store(true);  // never entered the loop; nothing to wait for
         consumer.join();
         return 1;
     }
@@ -172,10 +184,10 @@ int main(int argc, char** argv) {
                     // must always reach the consumer. Bailing out of this spin
                     // when g_running flips false during shutdown would
                     // silently drop it -- the consumer thread is still running
-                    // at this point (its own exit condition is
-                    // `!g_running && ring.empty()`, so it keeps draining until
-                    // there is truly nothing left), so there is never a reason
-                    // to abandon a push here.
+                    // at this point (its exit condition waits on g_reader_done,
+                    // not g_running -- see that flag's own comment for why the
+                    // two must not be conflated), so there is never a reason to
+                    // abandon a push here.
                     while (!ring.push(o)) {
                     }
                 }
@@ -213,6 +225,11 @@ int main(int argc, char** argv) {
     ::close(listen_fd);
     ::close(ep);
     g_running.store(false);
+    // Only now: every push this thread will ever make has already happened.
+    // The consumer waits on this, not on g_running, precisely so it cannot
+    // observe a transiently-empty ring in the window between the signal
+    // arriving and the final drain above actually finishing.
+    g_reader_done.store(true);
     consumer.join();
     return 0;
 }

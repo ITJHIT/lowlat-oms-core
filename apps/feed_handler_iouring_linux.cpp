@@ -82,6 +82,13 @@ constexpr std::size_t kRecvBufSize = 4096;
 
 std::atomic<bool> g_running{true};
 
+// Set once, by the reader thread, strictly after it has pushed its very last
+// order -- main loop AND the final drain pass both done. Deliberately NOT the
+// same signal as g_running: see feed_handler_linux.cpp's identical field for
+// why conflating the two loses in-flight orders whenever the shutdown-time
+// drain pushes something after the ring last looked empty to the consumer.
+std::atomic<bool> g_reader_done{false};
+
 int make_listen_socket(std::uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -176,7 +183,7 @@ int main(int argc, char** argv) {
         std::vector<Fill> fills;
         std::uint64_t matched = 0, rejected = 0;
         Order o;
-        while (g_running.load(std::memory_order_relaxed) || !ring.empty()) {
+        while (!g_reader_done.load(std::memory_order_relaxed) || !ring.empty()) {
             if (!ring.pop(o)) {
                 std::this_thread::yield();
                 continue;
@@ -197,6 +204,7 @@ int main(int argc, char** argv) {
     if (listen_fd < 0) {
         std::perror("listen");
         g_running.store(false);
+        g_reader_done.store(true);  // never entered the loop; nothing to wait for
         consumer.join();
         return 1;
     }
@@ -206,6 +214,7 @@ int main(int argc, char** argv) {
         std::perror("io_uring_queue_init");
         ::close(listen_fd);
         g_running.store(false);
+        g_reader_done.store(true);
         consumer.join();
         return 1;
     }
@@ -259,7 +268,8 @@ int main(int argc, char** argv) {
                     // Unconditional, matching feed_handler_linux.cpp: an
                     // order that has already been decoded must always reach
                     // the consumer, which is still running at this point (its
-                    // exit condition is `!g_running && ring.empty()`).
+                    // exit condition waits on g_reader_done, not g_running --
+                    // see that flag's own comment for why).
                     while (!ring.push(o)) {
                     }
                 }
@@ -342,6 +352,11 @@ int main(int argc, char** argv) {
     io_uring_queue_exit(&uring);
 
     g_running.store(false);
+    // Only now: every push this thread will ever make has already happened.
+    // The consumer waits on this, not on g_running, precisely so it cannot
+    // observe a transiently-empty ring in the window between the signal
+    // arriving and the final drain above actually finishing.
+    g_reader_done.store(true);
     consumer.join();
     return 0;
 }
