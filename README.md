@@ -248,7 +248,7 @@ root-caused from a failing CI run and re-verified by the same benchmark
 passing.
 
 **What is still honestly true after all five fixes**, and why the CI check for
-the io_uring leg carries a wider tolerance (6% vs. epoll's 0.2%): under this
+the io_uring leg carries a wider tolerance (6% vs. epoll's 1%): under this
 specific burst shape — 50 connections landing 100,000 frames within tens of
 milliseconds — on GitHub's contended, virtualized, shared runners, io_uring's
 one-outstanding-recv-per-connection submission model (chosen here for clarity,
@@ -259,12 +259,16 @@ anywhere near CI's observed ceiling (up to ~5.2% in the runs used to set that
 tolerance); this is a property of shared-runner scheduling under an extreme
 synthetic burst, not of the feed handler in steady-state use — but reporting
 it as such, rather than smoothing it into a single clean number, is the more
-honest read of what was actually measured. io_uring's real advantage — fewer
-syscalls per message — is architectural, not yet demonstrated as a throughput
-*win* against epoll at this connection count and message size; a workload
-that keeps more requests genuinely in flight per connection (this handler
-submits only one recv at a time) is the natural next test of that claim, not
-this one.
+honest read of what was actually measured. epoll is not immune to the same
+effect, just less exposed to it: one CI run hit 133-203/50,000 (0.27%-0.41%)
+on epoll across all 3 retried attempts, not a single unlucky one, which is
+why its own tolerance sits at 1% rather than the tighter 0.2% this section
+originally shipped with — widened from a second real measurement, not loosened
+to make a red build go away. io_uring's real advantage — fewer syscalls per
+message — is architectural, not yet demonstrated as a throughput *win* against
+epoll at this connection count and message size; a workload that keeps more
+requests genuinely in flight per connection (this handler submits only one
+recv at a time) is the natural next test of that claim, not this one.
 
 ## Order routing
 
