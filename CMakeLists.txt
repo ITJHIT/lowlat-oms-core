@@ -93,6 +93,12 @@ if(UNIX AND NOT APPLE)
         message(STATUS "liburing not found -- feed_handler_iouring target skipped "
                         "(install liburing-dev to build it)")
     endif()
+
+    # Multi-connection client for comparing the two feed handlers under
+    # concurrent load. Linux-only for the same reason they are: it targets a
+    # Linux-only TCP wire format.
+    add_executable(bench_feed_client bench/bench_feed_client.cpp)
+    target_link_libraries(bench_feed_client PRIVATE Threads::Threads)
 endif()
 
 if(UNIX)

@@ -128,6 +128,73 @@ jobs:
         run: python3 /tmp/feed_smoke.py ./build/feed_handler 19100 /tmp/feed_smoke.yaml
       - name: smoke-feed-handler-iouring
         run: python3 /tmp/feed_smoke.py ./build/feed_handler_iouring 19100 /tmp/feed_smoke.yaml
+      # epoll vs io_uring under concurrent load -- the comparison the README
+      # names as not yet measured. 50 connections x 4000 frames = 200,000
+      # frames = exactly 100,000 fills (see bench_feed_client.cpp's ordering
+      # argument for why that count is exact, not approximate). This is a
+      # shared GitHub Actions runner, not dedicated hardware -- the absolute
+      # numbers are noisy; what is meaningful is the two of them run back to
+      # back on the very same runner in the very same job.
+      - name: write the concurrent-load bench client config
+        run: |
+          cat > /tmp/feed_bench.yaml <<'EOF'
+          port: 19101
+          max_order_qty: 1000
+          max_position: 100000
+          reference_price: 115
+          price_band: 40
+          EOF
+          cat > /tmp/feed_bench.py <<'EOF'
+          import subprocess, sys, time
+
+          binary, port, cfg_path = sys.argv[1], sys.argv[2], sys.argv[3]
+          server = subprocess.Popen(
+              [binary, cfg_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+          )
+          try:
+              # ./build/bench_feed_client itself waits out the connect retries;
+              # give the server a moment to bind before the first attempt.
+              time.sleep(0.5)
+              client = subprocess.run(
+                  ["./build/bench_feed_client", "127.0.0.1", port, "50", "4000"],
+                  capture_output=True, text=True, timeout=60,
+              )
+              print(client.stdout)
+              if client.returncode != 0:
+                  print(client.stderr)
+                  print(f"{binary}: bench_feed_client failed")
+                  sys.exit(1)
+
+              time.sleep(1.0)  # let the matching consumer drain the ring
+              if server.poll() is not None:
+                  print(f"{binary}: server exited early with code {server.returncode}")
+                  sys.exit(1)
+
+              server.terminate()
+              try:
+                  out, _ = server.communicate(timeout=15)
+              except subprocess.TimeoutExpired:
+                  server.kill()
+                  print(f"{binary}: did not exit within 15s of SIGTERM")
+                  sys.exit(1)
+
+              text = (out or b"").decode(errors="replace")
+              print(text)
+              if "100000 fills" not in text:
+                  print(f"{binary}: expected exactly 100000 fills")
+                  sys.exit(1)
+              if "0 risk-rejected" not in text:
+                  print(f"{binary}: some orders were risk-rejected, not matched")
+                  sys.exit(1)
+          finally:
+              if server.poll() is None:
+                  server.kill()
+                  server.wait()
+          EOF
+      - name: bench-feed-handler-epoll
+        run: python3 /tmp/feed_bench.py ./build/feed_handler 19101 /tmp/feed_bench.yaml
+      - name: bench-feed-handler-iouring
+        run: python3 /tmp/feed_bench.py ./build/feed_handler_iouring 19101 /tmp/feed_bench.yaml
 
   windows:
     runs-on: windows-latest
