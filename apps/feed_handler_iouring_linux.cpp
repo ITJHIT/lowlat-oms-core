@@ -256,7 +256,11 @@ int main(int argc, char** argv) {
                 while (c->partial.size() >= kFrameSize) {
                     Order o = decode(c->partial.data());
                     c->partial.erase(c->partial.begin(), c->partial.begin() + kFrameSize);
-                    while (!ring.push(o) && g_running.load()) {
+                    // Unconditional, matching feed_handler_linux.cpp: an
+                    // order that has already been decoded must always reach
+                    // the consumer, which is still running at this point (its
+                    // exit condition is `!g_running && ring.empty()`).
+                    while (!ring.push(o)) {
                     }
                 }
                 submit_recv(&uring, c);
@@ -274,7 +278,57 @@ int main(int argc, char** argv) {
         io_uring_submit(&uring);
     }
 
-    // Shutdown. Outstanding SQEs (the last accept, and one recv per still-open
+    // Final drain, found the hard way (a 200k-frame concurrent-load benchmark
+    // came up short by a few dozen fills in CI). g_running flipping false only
+    // guarantees the io_uring_wait_cqe_timeout call ALREADY IN PROGRESS
+    // finishes; it says nothing about whether every recv SQE still
+    // outstanding at that moment had already completed (bytes copied into its
+    // Conn's buffer by the kernel) without anyone having reaped that CQE yet.
+    //
+    // This deliberately stays inside io_uring rather than falling back to a
+    // synchronous recv() on the same fds: a plain recv() would race the
+    // kernel against whichever outstanding recv SQE is still servicing that
+    // exact socket, and there is no clean way to tell afterward which of the
+    // two actually consumed a given byte. Reaping the completion queue is
+    // race-free by construction -- it only ever reports what io_uring itself
+    // already finished. A short bounded wait (rather than a non-blocking
+    // peek) also gives genuinely in-flight loopback traffic -- already
+    // in-kernel, arriving within microseconds -- one last real chance to
+    // complete before shutdown proceeds; ETIME twice in a row means nothing
+    // more is coming, so this does not turn a fast exit into a slow one in
+    // the ordinary case. Nothing here is re-armed: shutdown is underway, and
+    // submitting a fresh SQE at this point would just create one more
+    // outstanding request nothing will ever reap.
+    for (int misses = 0; misses < 2;) {
+        io_uring_cqe* cqe = nullptr;
+        __kernel_timespec ts{0, 50'000'000};  // 50ms
+        const int rc = io_uring_wait_cqe_timeout(&uring, &cqe, &ts);
+        if (rc == -ETIME) {
+            ++misses;
+            continue;
+        }
+        if (rc < 0) {
+            break;
+        }
+        misses = 0;
+
+        auto* op = static_cast<Op*>(io_uring_cqe_get_data(cqe));
+        if (op->kind == OpKind::Recv && cqe->res > 0) {
+            Conn* c = op->conn;
+            const int res = cqe->res;
+            c->partial.insert(c->partial.end(), c->buf.begin(), c->buf.begin() + res);
+            while (c->partial.size() >= kFrameSize) {
+                Order o = decode(c->partial.data());
+                c->partial.erase(c->partial.begin(), c->partial.begin() + kFrameSize);
+                while (!ring.push(o)) {
+                }
+            }
+        }
+        delete op;
+        io_uring_cqe_seen(&uring, cqe);
+    }
+
+    // Outstanding SQEs (the last accept, and one recv per still-open
     // connection) are not drained here: their Op allocations leak, once, for a
     // process that is exiting immediately afterward -- the same category of
     // non-issue as not calling free() on live heap right before exit(). A

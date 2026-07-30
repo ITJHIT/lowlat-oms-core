@@ -168,7 +168,15 @@ int main(int argc, char** argv) {
                 while (buf.size() >= kFrameSize) {
                     Order o = decode(buf.data());
                     buf.erase(buf.begin(), buf.begin() + kFrameSize);
-                    while (!ring.push(o) && g_running.load()) {
+                    // Unconditional: an order that has already been decoded
+                    // must always reach the consumer. Bailing out of this spin
+                    // when g_running flips false during shutdown would
+                    // silently drop it -- the consumer thread is still running
+                    // at this point (its own exit condition is
+                    // `!g_running && ring.empty()`, so it keeps draining until
+                    // there is truly nothing left), so there is never a reason
+                    // to abandon a push here.
+                    while (!ring.push(o)) {
                     }
                 }
             }
@@ -176,6 +184,28 @@ int main(int argc, char** argv) {
                 ::epoll_ctl(ep, EPOLL_CTL_DEL, fd, nullptr);
                 ::close(fd);
                 partial.erase(fd);
+            }
+        }
+    }
+
+    // Final drain, found the hard way (a 200k-frame concurrent-load benchmark
+    // came up short by a few dozen fills in CI). g_running flipping false only
+    // guarantees the epoll_wait call ALREADY IN PROGRESS finishes; it says
+    // nothing about whether every byte a connection's kernel receive buffer
+    // was already holding got read before the outer loop stopped asking. One
+    // more non-blocking pass over every still-open connection, unconditional
+    // on g_running, closes that race instead of leaving already-arrived data
+    // silently unread.
+    for (auto& [fd, buf] : partial) {
+        unsigned char tmp[4096];
+        ssize_t r;
+        while ((r = ::read(fd, tmp, sizeof(tmp))) > 0) {
+            buf.insert(buf.end(), tmp, tmp + r);
+            while (buf.size() >= kFrameSize) {
+                Order o = decode(buf.data());
+                buf.erase(buf.begin(), buf.begin() + kFrameSize);
+                while (!ring.push(o)) {
+                }
             }
         }
     }
