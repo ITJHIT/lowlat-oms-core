@@ -252,62 +252,88 @@ int main(int argc, char** argv) {
             break;  // the ring itself is in a bad state; stop rather than spin
         }
 
-        auto* op = static_cast<Op*>(io_uring_cqe_get_data(cqe));
-        const int res = cqe->res;
+        // Process the completion that woke us, then keep pulling any others
+        // already sitting in the completion queue with a non-blocking peek
+        // before paying for another io_uring_enter round trip, submitting
+        // once for the whole batch at the end. Found necessary after the
+        // accept-backlog and EAGAIN fixes above stopped explaining the
+        // benchmark's remaining shortfall on their own: reaping strictly one
+        // completion per syscall round trip is the one part of this loop
+        // with no equivalent in feed_handler_linux.cpp, whose read-to-EAGAIN
+        // loop drains an entire ready socket per epoll_wait wakeup, and
+        // whose epoll_wait itself reports every ready fd in one call rather
+        // than one syscall per fd. Under the bursty, all-at-once load this
+        // benchmark sends, that per-completion round-trip cost was enough
+        // for the server to fall behind the client on a contended runner --
+        // not because any single completion was mishandled, but because
+        // reaping them one at a time is slower than io_uring can produce
+        // them.
+        for (;;) {
+            auto* op = static_cast<Op*>(io_uring_cqe_get_data(cqe));
+            const int res = cqe->res;
 
-        if (op->kind == OpKind::Accept) {
-            if (res >= 0) {
-                const int conn_fd = res;
-                auto c = std::make_unique<Conn>();
-                c->fd = conn_fd;
-                Conn* raw = c.get();
-                conns.emplace(conn_fd, std::move(c));
-                submit_recv(&uring, raw);
-            }
-            // Re-arm regardless: a transient accept error must not stop the
-            // listener from accepting the next connection.
-            submit_accept(&uring, listen_fd);
-        } else {
-            Conn* c = op->conn;
-            if (res > 0) {
-                c->partial.insert(c->partial.end(), c->buf.begin(), c->buf.begin() + res);
-                while (c->partial.size() >= kFrameSize) {
-                    Order o = decode(c->partial.data());
-                    c->partial.erase(c->partial.begin(), c->partial.begin() + kFrameSize);
-                    // Unconditional, matching feed_handler_linux.cpp: an
-                    // order that has already been decoded must always reach
-                    // the consumer, which is still running at this point (its
-                    // exit condition waits on g_reader_done, not g_running --
-                    // see that flag's own comment for why).
-                    while (!ring.push(o)) {
-                    }
+            if (op->kind == OpKind::Accept) {
+                if (res >= 0) {
+                    const int conn_fd = res;
+                    auto c = std::make_unique<Conn>();
+                    c->fd = conn_fd;
+                    Conn* raw = c.get();
+                    conns.emplace(conn_fd, std::move(c));
+                    submit_recv(&uring, raw);
                 }
-                submit_recv(&uring, c);
-            } else if (res == -EAGAIN || res == -EINTR) {
-                // Transient, not a dead connection: io_uring's recv fast path
-                // can surface EAGAIN instead of internally arming a poll and
-                // waiting -- documented io_uring behavior under socket-buffer
-                // or io-wq scheduling pressure, which a busy shared CI runner
-                // reproduces far more often than a quiet box. Found by this
-                // being the one case still treated as "peer went away" even
-                // after the accept-backlog drain fix, and a benchmark that
-                // kept losing hundreds of frames from what should have been
-                // healthy connections -- discarding the connection here would
-                // throw away every frame it had left to send, not just the
-                // one recv that happened to come back EAGAIN. Resubmit and
-                // keep going, exactly like a real error is NOT handled.
-                submit_recv(&uring, c);
+                // Re-arm regardless: a transient accept error must not stop
+                // the listener from accepting the next connection.
+                submit_accept(&uring, listen_fd);
             } else {
-                // res == 0: peer closed. res < 0 other than the transient
-                // cases above: a real error. Nothing this feed handler can do
-                // with a dead connection except stop tracking it.
-                ::close(c->fd);
-                conns.erase(c->fd);
+                Conn* c = op->conn;
+                if (res > 0) {
+                    c->partial.insert(c->partial.end(), c->buf.begin(), c->buf.begin() + res);
+                    while (c->partial.size() >= kFrameSize) {
+                        Order o = decode(c->partial.data());
+                        c->partial.erase(c->partial.begin(), c->partial.begin() + kFrameSize);
+                        // Unconditional, matching feed_handler_linux.cpp: an
+                        // order that has already been decoded must always
+                        // reach the consumer, which is still running at this
+                        // point (its exit condition waits on g_reader_done,
+                        // not g_running -- see that flag's own comment for
+                        // why).
+                        while (!ring.push(o)) {
+                        }
+                    }
+                    submit_recv(&uring, c);
+                } else if (res == -EAGAIN || res == -EINTR) {
+                    // Transient, not a dead connection: io_uring's recv fast
+                    // path can surface EAGAIN instead of internally arming a
+                    // poll and waiting -- documented io_uring behavior under
+                    // socket-buffer or io-wq scheduling pressure, which a
+                    // busy shared CI runner reproduces far more often than a
+                    // quiet box. Found by this being the one case still
+                    // treated as "peer went away" even after the
+                    // accept-backlog drain fix, and a benchmark that kept
+                    // losing hundreds of frames from what should have been
+                    // healthy connections -- discarding the connection here
+                    // would throw away every frame it had left to send, not
+                    // just the one recv that happened to come back EAGAIN.
+                    // Resubmit and keep going, exactly like a real error is
+                    // NOT handled.
+                    submit_recv(&uring, c);
+                } else {
+                    // res == 0: peer closed. res < 0 other than the
+                    // transient cases above: a real error. Nothing this feed
+                    // handler can do with a dead connection except stop
+                    // tracking it.
+                    ::close(c->fd);
+                    conns.erase(c->fd);
+                }
+            }
+
+            delete op;
+            io_uring_cqe_seen(&uring, cqe);
+
+            if (io_uring_peek_cqe(&uring, &cqe) != 0) {
+                break;  // nothing else completed yet -- submit and go wait again
             }
         }
-
-        delete op;
-        io_uring_cqe_seen(&uring, cqe);
         io_uring_submit(&uring);
     }
 
@@ -345,43 +371,53 @@ int main(int argc, char** argv) {
         }
         misses = 0;
 
-        auto* op = static_cast<Op*>(io_uring_cqe_get_data(cqe));
-        if (op->kind == OpKind::Recv && cqe->res > 0) {
-            Conn* c = op->conn;
-            const int res = cqe->res;
-            c->partial.insert(c->partial.end(), c->buf.begin(), c->buf.begin() + res);
-            while (c->partial.size() >= kFrameSize) {
-                Order o = decode(c->partial.data());
-                c->partial.erase(c->partial.begin(), c->partial.begin() + kFrameSize);
-                while (!ring.push(o)) {
-                }
-            }
-        } else if (op->kind == OpKind::Accept && cqe->res >= 0) {
-            // A connection whose accept only completed during this drain
-            // phase has no outstanding recv SQE and nothing here will submit
-            // one (shutdown is underway) -- so it gets one inline synchronous
-            // drain instead, rather than being silently discarded along with
-            // every frame it was ever going to send. This is exactly the
-            // fallback the header comment above says to avoid for a
-            // connection with a recv SQE genuinely racing the kernel; there
-            // is no such race here, since this connection never had one.
-            const int conn_fd = cqe->res;
-            std::vector<unsigned char> late;
-            unsigned char tmp[kRecvBufSize];
-            ssize_t r;
-            while ((r = ::recv(conn_fd, tmp, sizeof(tmp), MSG_DONTWAIT)) > 0) {
-                late.insert(late.end(), tmp, tmp + r);
-                while (late.size() >= kFrameSize) {
-                    Order o = decode(late.data());
-                    late.erase(late.begin(), late.begin() + kFrameSize);
+        // Same peek-drain as the main loop above: a burst of completions
+        // that all landed together should not each cost their own 50ms wait
+        // cycle before the miss counter even starts counting down.
+        for (;;) {
+            auto* op = static_cast<Op*>(io_uring_cqe_get_data(cqe));
+            if (op->kind == OpKind::Recv && cqe->res > 0) {
+                Conn* c = op->conn;
+                const int res = cqe->res;
+                c->partial.insert(c->partial.end(), c->buf.begin(), c->buf.begin() + res);
+                while (c->partial.size() >= kFrameSize) {
+                    Order o = decode(c->partial.data());
+                    c->partial.erase(c->partial.begin(), c->partial.begin() + kFrameSize);
                     while (!ring.push(o)) {
                     }
                 }
+            } else if (op->kind == OpKind::Accept && cqe->res >= 0) {
+                // A connection whose accept only completed during this drain
+                // phase has no outstanding recv SQE and nothing here will
+                // submit one (shutdown is underway) -- so it gets one inline
+                // synchronous drain instead, rather than being silently
+                // discarded along with every frame it was ever going to
+                // send. This is exactly the fallback the header comment
+                // above says to avoid for a connection with a recv SQE
+                // genuinely racing the kernel; there is no such race here,
+                // since this connection never had one.
+                const int conn_fd = cqe->res;
+                std::vector<unsigned char> late;
+                unsigned char tmp[kRecvBufSize];
+                ssize_t r;
+                while ((r = ::recv(conn_fd, tmp, sizeof(tmp), MSG_DONTWAIT)) > 0) {
+                    late.insert(late.end(), tmp, tmp + r);
+                    while (late.size() >= kFrameSize) {
+                        Order o = decode(late.data());
+                        late.erase(late.begin(), late.begin() + kFrameSize);
+                        while (!ring.push(o)) {
+                        }
+                    }
+                }
+                ::close(conn_fd);
             }
-            ::close(conn_fd);
+            delete op;
+            io_uring_cqe_seen(&uring, cqe);
+
+            if (io_uring_peek_cqe(&uring, &cqe) != 0) {
+                break;  // nothing else completed yet -- go back to the timed wait
+            }
         }
-        delete op;
-        io_uring_cqe_seen(&uring, cqe);
     }
 
     // Accept-backlog drain, mirroring feed_handler_linux.cpp's identical fix
